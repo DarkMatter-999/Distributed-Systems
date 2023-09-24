@@ -28,15 +28,19 @@ type KeyValue struct {
 type MapF func(string, string) []KeyValue
 type ReduceF func(string, []string) string
 
-// main/mrworker.go calls this function.
-func Worker(mapf MapF, reducef ReduceF) {
+type HostAddress struct {
+	Host string
+	Port string
+}
+
+func Worker(host HostAddress, mapf MapF, reducef ReduceF) {
 	//log.SetOutput(io.Discard)
 
 	for {
 		time.Sleep(time.Second)
 		task := Task{}
-		if HeartBeat() {
-			call("MasterCoordinator.RequestTask", &Empty{}, &task)
+		if HeartBeat(host) {
+			call(host, "MasterCoordinator.RequestTask", &Empty{}, &task)
 
 			if task.Operation == ToWait {
 				continue
@@ -44,14 +48,14 @@ func Worker(mapf MapF, reducef ReduceF) {
 
 			if task.IsMap {
 				log.Printf("received map job %s", task.Mapfunc.Filename)
-				err := handleMap(task, mapf)
+				err := handleMap(host, task, mapf)
 				if err != nil {
 					log.Fatalf(err.Error())
 					return
 				}
 			} else {
 				log.Printf("received reduce job %d %v", task.Reducefunc.Id, task.Reducefunc.IntermediateFilenames)
-				err := handleReduce(task, reducef)
+				err := handleReduce(host, task, reducef)
 				if err != nil {
 					log.Fatalf(err.Error())
 					return
@@ -63,7 +67,7 @@ func Worker(mapf MapF, reducef ReduceF) {
 	}
 }
 
-func handleMap(task Task, mapf MapF) error {
+func handleMap(host HostAddress, task Task, mapf MapF) error {
 	filename := task.Mapfunc.Filename
 	file, err := os.Open(filename)
 	if err != nil {
@@ -90,11 +94,11 @@ func handleMap(task Task, mapf MapF) error {
 		_ = encoders[ihash(kv.Key)%task.NReduce].Encode(&kv)
 	}
 
-	call("MasterCoordinator.Finish", &FinishArgs{MapDone: true, Id: task.Mapfunc.Id}, &Empty{})
+	call(host, "MasterCoordinator.Finish", &FinishArgs{MapDone: true, Id: task.Mapfunc.Id}, &Empty{})
 	return nil
 }
 
-func handleReduce(task Task, reducef ReduceF) error {
+func handleReduce(host HostAddress, task Task, reducef ReduceF) error {
 	var kva []KeyValue
 	for _, filename := range task.Reducefunc.IntermediateFilenames {
 		iFile, err := os.Open(filename)
@@ -144,19 +148,19 @@ func handleReduce(task Task, reducef ReduceF) error {
 		return err
 	}
 
-	call("MasterCoordinator.Finish", &FinishArgs{MapDone: false, Id: task.Reducefunc.Id}, &Empty{})
+	call(host, "MasterCoordinator.Finish", &FinishArgs{MapDone: false, Id: task.Reducefunc.Id}, &Empty{})
 	return nil
 }
 
-func HeartBeat() bool {
-	if call("MasterCoordinator.HeartBeat", &Empty{}, &Empty{}) {
+func HeartBeat(host HostAddress) bool {
+	if call(host, "MasterCoordinator.HeartBeat", &Empty{}, &Empty{}) {
 		return true
 	}
 	return false
 }
 
-func call(rpcname string, args interface{}, reply interface{}) bool {
-	c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1337")
+func call(master HostAddress, rpcname string, args interface{}, reply interface{}) bool {
+	c, err := rpc.DialHTTP("tcp", master.Host+":"+master.Port)
 	if err != nil {
 		log.Println("dialing:", rpcname, " ", err)
 		return false

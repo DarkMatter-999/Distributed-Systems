@@ -2,21 +2,20 @@ package main
 
 import (
 	"ddn/mr"
-	"log"
+	"fmt"
+	"os"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
 )
 
 func main() {
-	/*
-		if len(os.Args) != 2 {
-			fmt.Fprintf(os.Stderr, "Usage: mrworker \n")
-			os.Exit(1)
-		}
-	*/
-	mr.Worker(Map, Reduce)
+	if len(os.Args) != 3 {
+		fmt.Fprintf(os.Stderr, "Usage: mrworker masterhost port\n")
+		os.Exit(1)
+	}
+	host := mr.HostAddress{Host: os.Args[1], Port: os.Args[2]}
+	mr.Worker(host, Map, Reduce)
 
 }
 
