@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package mr;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "src/mr";
+
+enum TaskState {
+  PENDING = 0;
+  EXECUTING = 1;
+  FINISHED = 2;
+}
+
+enum TaskOperation {
+  TO_WAIT = 0;
+  TO_RUN = 1;
+}
+
+message FinishArgs {
+  bool MapDone = 1;
+  int32 Id = 2;
+}
+
+message Empty {}
+
+message TaskDetails {
+  TaskState State = 1;
+  google.protobuf.Timestamp StartTime = 2;
+  int32 Id = 3;
+}
+
+message MapTask {
+  TaskDetails Task = 1;
+  string Filename = 2;
+}
+
+message ReduceTask {
+  TaskDetails Task = 1;
+  repeated string IntermediateFilenames = 2;
+}
+
+message Task {
+  TaskOperation Operation = 1;
+  bool IsMap = 2;
+  int32 NReduce = 3;
+  MapTask Mapfunc = 4;
+  ReduceTask Reducefunc = 5;
+}
+
