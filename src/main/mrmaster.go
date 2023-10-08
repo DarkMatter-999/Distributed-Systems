@@ -15,7 +15,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	server := mr.StartMaster(os.Args[1:], 5)
+	server := mr.StartMaster(os.Args[1:], 10)
 
 	for server.Done() == false {
 		time.Sleep(time.Second)

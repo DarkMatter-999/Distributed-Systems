@@ -143,6 +143,9 @@ func handleReduce(host HostAddress, task Task, reducef ReduceF) error {
 
 		i = j
 	}
+
+	temp.Close()
+
 	err = os.Rename(temp.Name(), oname)
 	if err != nil {
 		return err
