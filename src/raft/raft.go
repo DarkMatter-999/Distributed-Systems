@@ -204,7 +204,7 @@ func (r *Raft) requestVote(server int) {
 		if r.state == "CANDIDATE" && time.Now().Before(r.electionTimeout) {
 			host := r.conns[r.clusterIndex][server]
 			msg := fmt.Sprintf("VOTE-REQ %d %d %d %d", r.serverIndex, r.currentTerm, lastTerm, lastIndex)
-			fmt.Printf("%v %v\n", host, msg)
+			//fmt.Printf("%v %v\n", host, msg)
 			resp := sendAndRecvNoRetry(msg, host.ip, host.port, time.Duration(r.rpcPeriodMS))
 
 			if len(resp) > 0 && strings.Compare(resp[:8], "VOTE-REP") == 0 {
@@ -213,7 +213,7 @@ func (r *Raft) requestVote(server int) {
 				currTerm, _ := strconv.Atoi(res[2])
 				votedFor, _ := strconv.Atoi(res[3])
 
-				fmt.Printf("%s\n", resp)
+				//fmt.Printf("%s\n", resp)
 				r.processVoteReply(server, currTerm, votedFor)
 				break
 			}
@@ -324,38 +324,38 @@ func (r *Raft) sendAppendEntriesRequest(server int, res chan string) {
 
 	logSliceStr := ""
 	for _, log := range logSlice {
-		logSliceStr += fmt.Sprintf("(%s,%s);", log[0], log[1])
-	}
+		logSliceStr = fmt.Sprintf("(%s,%s);", log[0], log[1])
 
-	msg := fmt.Sprintf("APPEND-REQ %d %d %d %d [%s] %d", r.serverIndex, r.currentTerm, prevIdx, prevTerm, logSliceStr, r.commitIndex)
+		msg := fmt.Sprintf("APPEND-REQ %d %d %d %d [%s] %d", r.serverIndex, r.currentTerm, prevIdx, prevTerm, logSliceStr, r.commitIndex)
 
-	for {
-		if r.state == "LEADER" {
-			host := r.conns[r.clusterIndex][server]
+		for {
+			if r.state == "LEADER" {
+				host := r.conns[r.clusterIndex][server]
 
-			resp := sendAndRecvNoRetry(msg, host.ip, host.port, time.Duration(r.rpcPeriodMS))
+				resp := sendAndRecvNoRetry(msg, host.ip, host.port, time.Duration(r.rpcPeriodMS))
 
-			if resp != "" {
-				appendRep := strings.Fields(resp)
+				if resp != "" {
+					appendRep := strings.Fields(resp)
 
-				if len(appendRep) >= 4 && appendRep[0] == "APPEND-REP" {
-					server, currTermStr, flagStr, indexStr := appendRep[1], appendRep[2], appendRep[3], appendRep[4]
+					if len(appendRep) >= 4 && appendRep[0] == "APPEND-REP" {
+						server, currTermStr, flagStr, indexStr := appendRep[1], appendRep[2], appendRep[3], appendRep[4]
 
-					serverInt, _ := strconv.Atoi(server)
-					currTermInt, _ := strconv.Atoi(currTermStr)
-					flagInt, _ := strconv.Atoi(flagStr)
-					success := 0
-					if flagInt == 1 {
-						success = 1
+						serverInt, _ := strconv.Atoi(server)
+						currTermInt, _ := strconv.Atoi(currTermStr)
+						flagInt, _ := strconv.Atoi(flagStr)
+						success := 0
+						if flagInt == 1 {
+							success = 1
+						}
+						indexInt, _ := strconv.Atoi(indexStr)
+
+						r.processAppendReply(serverInt, currTermInt, success, indexInt)
+						break
 					}
-					indexInt, _ := strconv.Atoi(indexStr)
-
-					r.processAppendReply(serverInt, currTermInt, success, indexInt)
-					break
 				}
+			} else {
+				break
 			}
-		} else {
-			break
 		}
 	}
 
@@ -453,7 +453,7 @@ func (r *Raft) processRequest(conn net.Conn) {
 	defer conn.Close()
 
 	for {
-		buffer := make([]byte, 2048)
+		buffer := make([]byte, 4096)
 		_, err := conn.Read(buffer)
 		if err != nil {
 			// fmt.Println("Error reading from client:", err)
@@ -508,6 +508,7 @@ func (r *Raft) handleCommands(msg string, conn net.Conn) string {
 
 	if strings.HasPrefix(msg, "SET") {
 		parts := strings.Fields(msg)
+		fmt.Println(parts)
 		if len(parts) == 4 {
 			key := parts[1]
 			value := parts[2]
@@ -519,20 +520,26 @@ func (r *Raft) handleCommands(msg string, conn net.Conn) string {
 			if uint32(r.clusterIndex) == node {
 				for {
 					if r.state == "LEADER" {
-						lastIndex, err := r.commitlog.log(r.currentTerm, msg)
-						if err != 0 {
-							break
-						}
-						for {
+						// lastIndex, _ := r.commitlog.log(r.currentTerm, msg)
+
+						/* 						for {
 							if lastIndex == r.commitIndex {
 								break
 							}
-						}
+						} */
+
+						fmt.Println(r.ht.table)
+
 						r.ht.set(key, value, reqID)
+						output = "ok"
+						break
 					} else {
 						if r.leaderID != -1 && r.leaderID != r.serverIndex {
 							output = sendAndRecvNoRetry(msg, r.conns[node][r.leaderID].ip, r.conns[node][r.leaderID].port, time.Duration(r.rpcPeriodMS))
 							if len(output) > 0 {
+								if output == "ok" {
+									fmt.Println("SET SUCCESSFUL")
+								}
 								break
 							}
 						} else {
@@ -554,7 +561,8 @@ func (r *Raft) handleCommands(msg string, conn net.Conn) string {
 
 	} else if strings.HasPrefix(msg, "GET") {
 		parts := strings.Fields(msg)
-		if len(parts) == 3 {
+		fmt.Println(parts)
+		if len(parts) >= 3 {
 			key := parts[1]
 			node := hash(key) % uint32(len(r.partitions))
 
@@ -602,6 +610,7 @@ func (r *Raft) handleCommands(msg string, conn net.Conn) string {
 			output = r.processVoteRequest(server, currTerm, lastTerm, lastIndex)
 		}
 	} else if strings.HasPrefix(msg, "APPEND-REQ") {
+		fmt.Println(msg)
 		parts := strings.Fields(msg)
 		fmt.Println(parts)
 		if len(parts) == 7 {
