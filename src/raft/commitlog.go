@@ -68,7 +68,7 @@ func (cl *CommitLog) log(term int, command string) (int, int) {
 	}
 	defer file.Close()
 
-	now := time.Now().Format("01/01/2000 00:00:00")
+	now := time.Now().Format("02/01/2006 15:04:05")
 	message := fmt.Sprintf("%s,%d,%s\n", now, term, command)
 	_, err = file.WriteString(message)
 	if err != nil {

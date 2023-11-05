@@ -2,8 +2,6 @@ package raft
 
 import (
 	"fmt"
-	"hash/adler32"
-	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -18,424 +16,531 @@ type Connection struct {
 	port string
 }
 
+const MinElectionTimeout = 500
+const MaxElectionTimeout = 1000
+const RPCTimeout = 500
+
+const (
+	Follower = iota
+	Candidate
+	Leader
+)
+
+type CommandTerm struct {
+	Command interface{}
+	Term    int
+}
+
+type ApplyMsg struct {
+	CommandValid bool
+	Command      interface{}
+	CommandIndex int
+}
+type RequestVoteArgs struct {
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entry        []CommandTerm
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+	Xterm   int
+	XIndex  int
+	XLen    int
+}
+
 type Raft struct {
-	ip               string
-	port             string
-	ht               HashTable
-	commitlog        CommitLog
-	partitions       [][]string
-	conns            [][]*Connection
-	clusterIndex     int
-	serverIndex      int
-	currentTerm      int
-	votedFor         int
-	votes            map[int]bool
-	state            string
-	leaderID         int
-	commitIndex      int
-	nextIndices      []int
-	matchIndices     []int
-	electionPeriodMS int
-	rpcPeriodMS      int
-	electionTimeout  time.Time
-	rpcTimeout       []int
-	lock             sync.Mutex
+	ip   string
+	port string
+	ht   HashTable
+	//commitlog CommitLog
+	lock sync.Mutex
+
+	peers []*Connection
+
+	me           int   // this peer's index into peers[]
+	dead         int32 // set by Kill()
+	status       int
+	currentTerm  int
+	votedFor     int
+	log          []CommandTerm
+	commitIndex  int
+	lastApplied  int
+	lastLogIndex int
+	nextIndex    []int
+	matchIndex   []int
+	lastAccessed time.Time
+	applyMsg     chan ApplyMsg
 }
 
-func hash(input string) uint32 {
-	hasher := adler32.New()
-	io.WriteString(hasher, input)
-	return hasher.Sum32()
-}
+func NewRaft(ip, port, peers string, applyCh chan ApplyMsg) *Raft {
+	inputpeers := parsePartitions(peers)
 
-func NewRaft(ip, port, partitions string) *Raft {
-	inputpartitions := parsePartitions(partitions)
+	r := &Raft{}
 
-	raft := Raft{
-		ip:               ip,
-		port:             port,
-		ht:               *newHashTable(),
-		commitlog:        *newCommitLog(fmt.Sprintf("commit-log-%s-%s.txt", ip, port)),
-		partitions:       inputpartitions,
-		conns:            make([][]*Connection, len(strings.Fields(partitions))),
-		clusterIndex:     -1,
-		serverIndex:      -1,
-		currentTerm:      1,
-		votedFor:         -1,
-		votes:            make(map[int]bool),
-		state:            "FOLLOWER",
-		leaderID:         -1,
-		commitIndex:      0,
-		electionPeriodMS: rand.Intn(4000) + 1000,
-		rpcPeriodMS:      3000,
-		electionTimeout:  time.Now(),
-	}
+	r.lock.Lock()
+	r.lock.Unlock()
 
-	raft.commitlog.Init()
+	r.ip = ip
+	r.port = port
+	r.ht = *newHashTable()
+	//r.commitlog = *newCommitLog(fmt.Sprintf("commit-log-%s-%s.txt", ip, port))
+	r.peers = make([]*Connection, len(inputpeers))
 
-	raft.initConnections()
-
-	fmt.Println("Ready....")
-	return &raft
-}
-
-func (r *Raft) initConnections() {
-	for i := 0; i < len(r.partitions); i++ {
-		cluster := r.partitions[i]
-		// fmt.Printf("%v", cluster)
-		r.conns[i] = make([]*Connection, len(cluster))
-
-		for j := 0; j < len(cluster); j++ {
-			host := strings.Split(cluster[j], ":")
-			if host[0] == r.ip && host[1] == r.port {
-				r.clusterIndex = i
-				r.serverIndex = j
-			} else {
-				r.conns[i][j] = &Connection{
-					ip:   host[0],
-					port: host[1],
-				}
+	for i := 0; i < len(inputpeers); i++ {
+		host := strings.Split(inputpeers[i], ":")
+		if !(host[0] == r.ip && host[1] == r.port) {
+			r.peers[i] = &Connection{
+				ip:   host[0],
+				port: host[1],
 			}
+		} else {
+			r.me = i
 		}
 	}
 
-	u := len(r.partitions[r.clusterIndex])
-
-	if len(r.partitions[r.clusterIndex]) > 1 {
-		r.state = "FOLLOWER"
-	} else {
-		r.state = "LEADER"
+	r.status = Follower
+	r.log = []CommandTerm{
+		{
+			Command: nil,
+			Term:    0,
+		},
 	}
-	r.leaderID = -1
-	r.commitIndex = 0
-	r.nextIndices = make([]int, u)
-	r.matchIndices = make([]int, u)
-	r.electionPeriodMS = rand.Intn(4000) + 1000
-	r.rpcPeriodMS = 3000
-	r.electionTimeout = time.Now()
-	r.rpcTimeout = make([]int, u)
+	r.votedFor = -1
+	r.nextIndex = make([]int, len(r.peers))
+	r.matchIndex = make([]int, len(r.peers))
+	r.applyMsg = applyCh
 
-	for i := 0; i < u; i++ {
-		r.matchIndices[i] = -1
-		r.rpcTimeout[i] = -1
-	}
+	//r.commitlog.Init()
+
+	fmt.Println("Ready....")
+
+	go r.Init()
+
+	return r
 }
 
-func parsePartitions(input string) [][]string {
+func randomTimeout() time.Duration {
+	timeout := MinElectionTimeout + rand.Intn(MaxElectionTimeout-MinElectionTimeout)
+	return time.Duration(timeout) * time.Millisecond
+}
+
+func parsePartitions(input string) []string {
 	ips := strings.Split(input, ",")
 
-	partitions := make([][]string, 1)
-
-	partitions[0] = make([]string, len(ips))
+	peers := make([]string, len(ips))
 
 	for idx, ip := range ips {
-		partitions[0][idx] = ip
+		peers[idx] = ip
 	}
 
-	return partitions
+	return peers
 }
 
 func (r *Raft) Init() {
-	r.setRandomElectionTimeout()
-
-	go r.onElectionTimeout()
-
-	go r.leaderSendAppendEntries()
-}
-
-func (r *Raft) setElectionTimeout(timeout time.Time) {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-
-	r.electionTimeout = timeout
-}
-
-func (r *Raft) setRandomElectionTimeout() {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-
-	r.electionTimeout = time.Now().Add(time.Millisecond * time.Duration(rand.Intn(r.electionPeriodMS)))
-}
-
-func (r *Raft) onElectionTimeout() {
 	for {
-		if time.Now().After(r.electionTimeout) && (r.state == "FOLLOWER" || r.state == "CANDIDATE") {
-			fmt.Println("Timeout....")
-			r.setRandomElectionTimeout()
-			go r.startElection()
+		r.lock.Lock()
+		status := r.status
+		r.lock.Unlock()
+
+		if status == Follower {
+			r.handleFollower()
+		} else if status == Candidate {
+			r.handleCandidate()
+		} else if status == Leader {
+			r.handleLeader()
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-func (r *Raft) startElection() {
+func (r *Raft) Start(command interface{}) (int, int, bool) {
+	index := -1
+	term := -1
+	isLeader := true
+
 	r.lock.Lock()
 	defer r.lock.Unlock()
+	isLeader = r.status == Leader
+	if !isLeader {
+		return 0, 0, false
+	}
 
-	fmt.Println("Starting election...")
+	term = r.currentTerm
+	r.log = append(r.log, CommandTerm{
+		Command: command,
+		Term:    term,
+	})
+	r.lastLogIndex = len(r.log) - 1
+	index = r.lastLogIndex
+	//r.persist()
+	return index, term, isLeader
+}
 
-	r.state = "CANDIDATE"
-	r.votedFor = r.serverIndex
-	r.currentTerm++
-	r.votes = make(map[int]bool)
-	r.votes[r.serverIndex] = true
+func (r *Raft) handleFollower() {
+	dur := randomTimeout()
+	time.Sleep(dur)
+	r.lock.Lock()
+	lastAccessed := r.lastAccessed
+	r.lock.Unlock()
 
-	var wg sync.WaitGroup
-	for j := 0; j < len(r.partitions[r.clusterIndex]); j++ {
-		if j != r.serverIndex {
-			wg.Add(1)
-			go func(server int) {
-				defer wg.Done()
-				r.requestVote(server)
-			}(j)
+	if time.Now().Sub(lastAccessed).Milliseconds() >= dur.Milliseconds() {
+		r.lock.Lock()
+		r.status = Candidate
+		r.currentTerm++
+		r.votedFor = -1
+		//rf.persist()
+		r.lock.Unlock()
+	}
+}
+
+func (r *Raft) handleCandidate() {
+	dur := randomTimeout()
+
+	start := time.Now()
+	r.lock.Lock()
+	peers := r.peers
+	me := r.me
+	term := r.currentTerm
+	lastLogIndex := r.lastLogIndex
+	lastLogTerm := r.log[lastLogIndex].Term
+	r.lock.Unlock()
+	count := 0
+	total := len(peers)
+	finished := 0
+	majority := (total / 2) + 1
+
+	for peer := range peers {
+		if me == peer {
+			r.lock.Lock()
+			count++
+			finished++
+			r.lock.Unlock()
+			continue
+		}
+
+		go func(peer int) {
+			args := RequestVoteArgs{}
+			args.Term = term
+			args.CandidateId = me
+			args.LastLogIndex = lastLogIndex
+			args.LastLogTerm = lastLogTerm
+			reply := RequestVoteReply{}
+			ok := r.requestVote(peer, &args, &reply)
+			r.lock.Lock()
+			defer r.lock.Unlock()
+			if !ok {
+				finished++
+				return
+			}
+			if reply.VoteGranted {
+				finished++
+				count++
+			} else {
+				finished++
+				if args.Term < reply.Term {
+					r.status = Follower
+					//r.persist()
+				}
+			}
+		}(peer)
+	}
+
+	for {
+		r.lock.Lock()
+		if count >= majority || finished == total || time.Now().Sub(start).Milliseconds() >= dur.Milliseconds() {
+			break
+		}
+		r.lock.Unlock()
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if time.Now().Sub(start).Milliseconds() >= dur.Milliseconds() {
+		r.status = Follower
+		r.lock.Unlock()
+		return
+	}
+
+	if r.status == Candidate && count >= majority {
+		r.status = Leader
+		for peer := range peers {
+			r.nextIndex[peer] = r.lastLogIndex + 1
+		}
+	} else {
+		r.status = Follower
+	}
+	//r.persist()
+	r.lock.Unlock()
+}
+
+func (r *Raft) handleLeader() {
+	r.lock.Lock()
+	me := r.me
+	term := r.currentTerm
+	commitIndex := r.commitIndex
+	peers := r.peers
+	nextIndex := r.nextIndex
+
+	lastLogIndex := r.lastLogIndex
+	matchIndex := r.matchIndex
+	nextIndex[me] = lastLogIndex + 1
+	matchIndex[me] = lastLogIndex
+	log := r.log
+	r.lock.Unlock()
+	for n := commitIndex + 1; n <= lastLogIndex; n++ {
+		count := 0
+		total := len(peers)
+		majority := (total / 2) + 1
+		for peer := range peers {
+			if matchIndex[peer] >= n && log[n].Term == term {
+				count++
+			}
+		}
+
+		if count >= majority {
+			r.lock.Lock()
+			i := r.commitIndex + 1
+			for ; i <= n; i++ {
+				r.applyMsg <- ApplyMsg{
+					CommandValid: true,
+					Command:      log[i].Command,
+					CommandIndex: i,
+				}
+				r.commitIndex = r.commitIndex + 1
+			}
+			r.lock.Unlock()
 		}
 	}
 
-	wg.Wait()
+	for peer := range peers {
+		if peer == me {
+			continue
+		}
+
+		args := AppendEntriesArgs{}
+		reply := AppendEntriesReply{}
+		r.lock.Lock()
+		args.Term = r.currentTerm
+		prevLogIndex := nextIndex[peer] - 1
+		args.PrevLogIndex = prevLogIndex
+		args.PrevLogTerm = r.log[prevLogIndex].Term
+		args.LeaderCommit = r.commitIndex
+		args.LeaderId = r.me
+		if nextIndex[peer] <= lastLogIndex {
+			args.Entry = r.log[prevLogIndex+1 : lastLogIndex+1]
+		}
+		r.lock.Unlock()
+
+		go func(peer int) {
+			ok := r.AppendEntriesRequest(peer, &args, &reply)
+			if !ok {
+				return
+			}
+
+			r.lock.Lock()
+			if reply.Success {
+				r.nextIndex[peer] = min(r.nextIndex[peer]+len(args.Entry), r.lastLogIndex+1)
+				r.matchIndex[peer] = prevLogIndex + len(args.Entry)
+			} else {
+				if reply.Term > args.Term {
+					r.status = Follower
+					r.lock.Unlock()
+					return
+				}
+				if reply.Xterm == -1 {
+					r.nextIndex[peer] = reply.XLen
+					r.lock.Unlock()
+					return
+				}
+				index := -1
+				for i, v := range r.log {
+					if v.Term == reply.Xterm {
+						index = i
+					}
+				}
+				if index == -1 {
+					r.nextIndex[peer] = reply.XIndex
+				} else {
+					r.nextIndex[peer] = index
+				}
+			}
+			r.lock.Unlock()
+		}(peer)
+	}
 }
 
-func (r *Raft) requestVote(server int) {
-	lastIndex, lastTerm := r.commitlog.getLastItemTerm()
-
+func (r *Raft) requestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	fmt.Printf("Requesting vote from %d\n", server)
-	for {
-		fmt.Printf("Requesting vote from %d\n", server)
+	host := r.peers[server]
+	msg := fmt.Sprintf("VOTE-REQ %d %d %d %d", args.Term, args.CandidateId, args.LastLogTerm, args.LastLogIndex)
+	//fmt.Printf("%v %v\n", host, msg)
+	resp := sendAndRecvNoRetry(msg, host.ip, host.port, RPCTimeout)
 
-		if r.state == "CANDIDATE" && time.Now().Before(r.electionTimeout) {
-			host := r.conns[r.clusterIndex][server]
-			msg := fmt.Sprintf("VOTE-REQ %d %d %d %d", r.serverIndex, r.currentTerm, lastTerm, lastIndex)
-			//fmt.Printf("%v %v\n", host, msg)
-			resp := sendAndRecvNoRetry(msg, host.ip, host.port, time.Duration(r.rpcPeriodMS))
+	if len(resp) > 0 && strings.Compare(resp[:8], "VOTE-REP") == 0 {
+		res := strings.Split(resp[8:], " ")
+		//server, _ := strconv.Atoi(res[1])
+		currTerm, _ := strconv.Atoi(res[2])
+		vote, _ := strconv.Atoi(res[3])
 
-			if len(resp) > 0 && strings.Compare(resp[:8], "VOTE-REP") == 0 {
-				res := strings.Split(resp[8:], " ")
-				server, _ := strconv.Atoi(res[1])
-				currTerm, _ := strconv.Atoi(res[2])
-				votedFor, _ := strconv.Atoi(res[3])
+		//fmt.Printf("%s\n", resp)
+		reply.Term = currTerm
+		reply.VoteGranted = vote > 0
+		return true
+	}
+	return false
+}
 
-				//fmt.Printf("%s\n", resp)
-				r.processVoteReply(server, currTerm, votedFor)
+func (r *Raft) processVoteRequest(term, server, lastTerm, lastIndex int) string {
+	fmt.Printf("Processing vote request from %d %d\n", server, term)
+
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if r.currentTerm == term && r.votedFor == server {
+		return fmt.Sprintf("VOTE-REP %d %d %d", server, r.currentTerm, 1)
+	}
+	if r.currentTerm > term ||
+		(r.currentTerm == term && r.votedFor != -1) {
+		return fmt.Sprintf("VOTE-REP %d %d %d", server, r.currentTerm, 0)
+	}
+	if term > r.currentTerm {
+		r.currentTerm, r.votedFor = term, -1
+		r.status = Follower
+	}
+	if r.lastLogIndex-1 >= 0 {
+		lastLogTerm := r.log[r.lastLogIndex-1].Term
+		if lastLogTerm > lastTerm ||
+			(lastLogTerm == lastTerm && r.lastLogIndex > lastIndex) {
+			return fmt.Sprintf("VOTE-REP %d %d %d", server, term, 0)
+		}
+	}
+	r.status = Follower
+	r.lastAccessed = time.Now()
+	r.votedFor = server
+
+	return fmt.Sprintf("VOTE-REP %d %d %d", server, term, 1)
+}
+
+func (r *Raft) AppendEntriesRequest(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	fmt.Printf("Sending append entries to %d...\n", server)
+
+	logSliceStr := ""
+	for _, log := range args.Entry {
+		logSliceStr += fmt.Sprintf("(%s,%d);", log.Command, log.Term)
+	}
+
+	msg := fmt.Sprintf("APPEND-REQ %d %d %d %d [%s] %d", args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, logSliceStr, args.LeaderCommit)
+
+	host := r.peers[server]
+
+	resp := sendAndRecvNoRetry(msg, host.ip, host.port, time.Duration(RPCTimeout*time.Millisecond))
+
+	if resp != "" {
+		appendRep := strings.Fields(resp)
+
+		if len(appendRep) >= 4 && appendRep[0] == "APPEND-REP" {
+			success, term, xlen, xterm, xindex := appendRep[1], appendRep[2], appendRep[3], appendRep[4], appendRep[5]
+
+			successInt, _ := strconv.Atoi(success)
+			termInt, _ := strconv.Atoi(term)
+			xlenInt, _ := strconv.Atoi(xlen)
+			xtermInt, _ := strconv.Atoi(xterm)
+			xindexInt, _ := strconv.Atoi(xindex)
+
+			reply.Success = successInt == 1
+			reply.Term = termInt
+			reply.XLen = xlenInt
+			reply.Xterm = xtermInt
+			reply.XIndex = xindexInt
+
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Raft) processAppendRequests(server int, term int, prevIdx int, prevTerm int, logs []CommandTerm, leaderCommit int) string {
+	fmt.Printf("Processing append request from %d %d...\n", server, term)
+
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	Xterm := -1
+	XIndex := -1
+	XLen := len(r.log)
+	Success := 0
+	Term := r.currentTerm
+	if term < r.currentTerm {
+		return fmt.Sprintf("APPEND-REP %d %d %d %d %d", Success, Term, Xterm, XLen, XIndex)
+	}
+
+	if len(r.log) < prevIdx+1 {
+		return fmt.Sprintf("APPEND-REP %d %d %d %d %d", Success, Term, Xterm, XLen, XIndex)
+	}
+
+	if r.log[prevIdx].Term != prevTerm {
+		Xterm = r.log[prevIdx].Term
+		for i, v := range r.log {
+			if v.Term == Xterm {
+				XIndex = i
 				break
 			}
-		} else {
+		}
+
+		return fmt.Sprintf("APPEND-REP %d %d %d %d %d", Success, Term, Xterm, XLen, XIndex)
+	}
+
+	index := 0
+	for ; index < len(logs); index++ {
+		currentIndex := prevIdx + 1 + index
+		if currentIndex > len(r.log)-1 {
+			break
+		}
+		if r.log[currentIndex].Term != logs[index].Term {
+			r.log = r.log[:currentIndex]
+			r.lastLogIndex = len(r.log) - 1
+			//rf.persist()
 			break
 		}
 	}
-}
 
-func (r *Raft) processVoteReply(server, term, votedFor int) {
-	fmt.Printf("Processing vote reply from server: %d term: %d..\n", server, term)
-	if term > r.currentTerm {
-		r.stepDown(term)
+	Success = 1
+	r.lastAccessed = time.Now()
+	if len(logs) > 0 {
+		r.log = append(r.log, logs[index:]...)
+		r.lastLogIndex = len(r.log) - 1
+		//rf.persist()
 	}
-	if term <= r.currentTerm && r.state == "CANDIDATE" {
-		if votedFor == r.serverIndex {
-			r.votes[server] = true
-		}
-		if len(r.votes) > len(r.partitions[r.clusterIndex])/2 {
-			r.state = "LEADER"
-			r.leaderID = r.serverIndex
-			fmt.Printf("%d %d became Leader\n", r.clusterIndex, r.serverIndex)
-			fmt.Printf("%v - %d\t", r.votes, r.currentTerm)
-		}
-	}
-}
-
-func (r *Raft) stepDown(term int) {
-	fmt.Printf("Stepping down\n")
-	r.currentTerm = term
-	r.state = "FOLLOWER"
-	r.votedFor = -1
-	r.setRandomElectionTimeout()
-}
-
-func (r *Raft) processVoteRequest(server, term, lastTerm, lastIndex int) string {
-	fmt.Printf("Processing vote request from %d %d\n", server, term)
-	if term > r.currentTerm {
-		r.stepDown(term)
-	}
-	rlastIndex, rlastTerm := r.commitlog.getLastItemTerm()
-	if (term == r.currentTerm) && (r.votedFor == server || r.votedFor == -1) && (lastTerm > rlastTerm || (lastTerm == rlastTerm && lastIndex >= rlastIndex)) {
-		r.votedFor = server
-		r.state = "FOLLOWER"
-		r.setRandomElectionTimeout()
-	}
-	return fmt.Sprintf("VOTE-REP %d %d %d", r.serverIndex, r.currentTerm, r.votedFor)
-}
-
-func (r *Raft) leaderSendAppendEntries() {
-	fmt.Println("Sending Append entries from leader")
-	for {
-		if r.state == "LEADER" {
-			r.appendEntries()
-			lastIndex, _ := r.commitlog.getLastItemTerm()
-			r.commitIndex = lastIndex
-		}
-	}
-}
-
-func (r *Raft) appendEntries() {
-	var wg sync.WaitGroup
-
-	for j := 0; j < len(r.partitions[r.clusterIndex]); j++ {
-		if j != r.serverIndex {
-			wg.Add(1)
-			go func(j int) {
-				defer wg.Done()
-				r.sendAppendEntriesRequest(j, nil)
-			}(j)
-		}
-	}
-
-	if len(r.partitions[r.clusterIndex]) > 1 {
-		var cnts int
-		done := make(chan struct{}, len(r.partitions[r.clusterIndex])/2)
-
-		for i := 0; i < len(r.partitions[r.clusterIndex])/2; i++ {
-			<-done
-			cnts++
-			if cnts > (len(r.partitions[r.clusterIndex])/2)-1 {
-				return
-			}
-		}
-	} else {
-		return
-	}
-}
-
-func (r *Raft) sendAppendEntriesRequest(server int, res chan string) {
-	fmt.Printf("Sending append entries to %d...\n", server)
-
-	prevIdx := r.nextIndices[server] - 1
-
-	logSlice := r.commitlog.ReadLogsStartEnd(prevIdx, nil)
-
-	var prevTerm int
-	if prevIdx == -1 {
-		prevTerm = 0
-	} else {
-		if len(logSlice) > 0 {
-			prevTerm, _ = strconv.Atoi(logSlice[0][0])
-			logSlice = logSlice[1:]
-		} else {
-			prevTerm = 0
-		}
-	}
-
-	logSliceStr := ""
-	for _, log := range logSlice {
-		logSliceStr = fmt.Sprintf("(%s,%s);", log[0], log[1])
-
-		msg := fmt.Sprintf("APPEND-REQ %d %d %d %d [%s] %d", r.serverIndex, r.currentTerm, prevIdx, prevTerm, logSliceStr, r.commitIndex)
-
-		for {
-			if r.state == "LEADER" {
-				host := r.conns[r.clusterIndex][server]
-
-				resp := sendAndRecvNoRetry(msg, host.ip, host.port, time.Duration(r.rpcPeriodMS))
-
-				if resp != "" {
-					appendRep := strings.Fields(resp)
-
-					if len(appendRep) >= 4 && appendRep[0] == "APPEND-REP" {
-						server, currTermStr, flagStr, indexStr := appendRep[1], appendRep[2], appendRep[3], appendRep[4]
-
-						serverInt, _ := strconv.Atoi(server)
-						currTermInt, _ := strconv.Atoi(currTermStr)
-						flagInt, _ := strconv.Atoi(flagStr)
-						success := 0
-						if flagInt == 1 {
-							success = 1
-						}
-						indexInt, _ := strconv.Atoi(indexStr)
-
-						r.processAppendReply(serverInt, currTermInt, success, indexInt)
-						break
-					}
-				}
-			} else {
-				break
+	if leaderCommit > r.commitIndex {
+		min := min(leaderCommit, r.lastLogIndex)
+		for i := r.commitIndex + 1; i <= min; i++ {
+			r.commitIndex = i
+			r.applyMsg <- ApplyMsg{
+				CommandValid: true,
+				Command:      r.log[i].Command,
+				CommandIndex: i,
 			}
 		}
 	}
 
-	if res != nil {
-		res <- "ok"
-	}
-}
+	//fmt.Println(fmt.Sprintf("APPEND-REP %d %d %d %d %d", Success, Term, Xterm, XLen, XIndex))
 
-func (r *Raft) processAppendRequests(server int, term int, prevIdx int, prevTerm int, logs [][]string, commitIndex int) string {
-	fmt.Printf("Processing append request from %d %d...\n", server, term)
-
-	r.setRandomElectionTimeout()
-
-	flag, index := 0, 0
-
-	if term > r.currentTerm {
-		r.stepDown(term)
-	}
-
-	if term == r.currentTerm {
-		r.leaderID = server
-		success := false
-		selfLogs := make([][]string, 0)
-		if prevIdx != -1 {
-			selfLogs = r.commitlog.ReadLogsStartEnd(prevIdx, &prevIdx)
-		} else {
-			success = true
-		}
-
-		if len(selfLogs) > 0 {
-			init, _ := strconv.Atoi(selfLogs[0][0])
-
-			success = (len(selfLogs) > 0 && init == prevTerm)
-
-			if success {
-				lastIndex, lastTerm := r.commitlog.getLastItemTerm()
-
-				last, _ := strconv.Atoi(logs[len(logs)-1][0])
-				if len(logs) > 0 && lastTerm == last && lastIndex == r.commitIndex {
-					index = r.commitIndex
-				} else {
-					index = r.storeEntries(prevIdx, logs)
-				}
-			}
-		}
-		if success {
-			flag = 1
-		}
-
-	}
-
-	fmt.Println(fmt.Sprintf("APPEND-REP %d %d %d %d", r.serverIndex, r.currentTerm, flag, index))
-
-	return fmt.Sprintf("APPEND-REP %d %d %d %d", r.serverIndex, r.currentTerm, flag, index)
-}
-
-func (r *Raft) processAppendReply(server, term, success, index int) {
-	fmt.Printf("Processing append reply from %d %d %d", server, term, success)
-	if term > r.currentTerm {
-		r.stepDown(term)
-	}
-
-	if r.state == "LEADER" && term == r.currentTerm {
-		if success > 0 {
-			r.nextIndices[server] = index + 1
-		} else {
-			r.nextIndices[server] = max(0, r.nextIndices[server]-1)
-			r.sendAppendEntriesRequest(server, nil)
-		}
-	}
-}
-
-func (r *Raft) storeEntries(prevIdx int, leaderLogs [][]string) int {
-	cmd := make([]string, len(leaderLogs))
-	for i := 0; i < len(leaderLogs); i++ {
-		cmd[i] = leaderLogs[i][1]
-	}
-	lastIndex, _ := r.commitlog.logReplace(r.currentTerm, cmd, prevIdx+1)
-	r.commitIndex = lastIndex
-	return lastIndex
+	return fmt.Sprintf("APPEND-REP %d %d %d %d %d", Success, Term, Xterm, XLen, XIndex)
 }
 
 func (r *Raft) updateStateMachine(cmd string) {
@@ -453,7 +558,7 @@ func (r *Raft) processRequest(conn net.Conn) {
 	defer conn.Close()
 
 	for {
-		buffer := make([]byte, 4096)
+		buffer := make([]byte, 2048)
 		_, err := conn.Read(buffer)
 		if err != nil {
 			// fmt.Println("Error reading from client:", err)
@@ -491,7 +596,7 @@ func (r *Raft) ListenToClients() {
 			continue
 		}
 
-		fmt.Printf("Connected to new client at address %s\n", clientConn.RemoteAddr())
+		//fmt.Printf("Connected to new client at address %s\n", clientConn.RemoteAddr())
 
 		wg.Add(1)
 		go func(conn net.Conn) {
@@ -508,90 +613,59 @@ func (r *Raft) handleCommands(msg string, conn net.Conn) string {
 
 	if strings.HasPrefix(msg, "SET") {
 		parts := strings.Fields(msg)
-		fmt.Println(parts)
 		if len(parts) == 4 {
 			key := parts[1]
 			value := parts[2]
 			reqID, _ := strconv.Atoi(parts[3])
 
 			output = "ko"
-			node := hash(key) % uint32(len(r.partitions))
 
-			if uint32(r.clusterIndex) == node {
-				for {
-					if r.state == "LEADER" {
-						// lastIndex, _ := r.commitlog.log(r.currentTerm, msg)
-
-						/* 						for {
-							if lastIndex == r.commitIndex {
-								break
-							}
-						} */
-
-						fmt.Println(r.ht.table)
-
-						r.ht.set(key, value, reqID)
-						output = "ok"
-						break
-					} else {
-						if r.leaderID != -1 && r.leaderID != r.serverIndex {
-							output = sendAndRecvNoRetry(msg, r.conns[node][r.leaderID].ip, r.conns[node][r.leaderID].port, time.Duration(r.rpcPeriodMS))
-							if len(output) > 0 {
-								if output == "ok" {
-									fmt.Println("SET SUCCESSFUL")
-								}
-								break
-							}
+			for {
+				if r.status == Leader {
+					r.ht.set(key, value, reqID)
+					output = "ok"
+					break
+				} else {
+					if r.status == Follower {
+						output = sendAndRecvNoRetry(msg, r.peers[r.votedFor].ip, r.peers[r.votedFor].port, time.Duration(RPCTimeout*time.Millisecond))
+						if len(output) > 0 {
+							break
 						} else {
 							output = "ko"
 							break
 						}
 					}
-				}
-			} else {
-				output = sendAndRecvNoRetry(msg, r.conns[node][r.leaderID].ip, r.conns[node][r.leaderID].port, time.Duration(r.rpcPeriodMS))
-				if len(output) == 0 {
-					output = "ko"
 				}
 			}
 		} else {
 			fmt.Println("Invalid SET command format")
 			return "Error: Invalid command"
 		}
-
 	} else if strings.HasPrefix(msg, "GET") {
 		parts := strings.Fields(msg)
 		fmt.Println(parts)
 		if len(parts) >= 3 {
 			key := parts[1]
-			node := hash(key) % uint32(len(r.partitions))
 
-			if r.clusterIndex == int(node) {
-				for {
-					if r.state == "LEADER" {
-						val := r.ht.get(key)
-						if str, ok := val.(string); ok {
-							output = str
-						} else {
-							output = "Error: Non existent key"
-							break
-						}
+			for {
+				if r.status == Leader {
+					val := r.ht.get(key)
+					if str, ok := val.(string); ok {
+						output = str
 					} else {
-						if r.leaderID != -1 && r.leaderID != r.serverIndex {
-							output = sendAndRecvNoRetry(msg, r.conns[node][r.leaderID].ip, r.conns[node][r.leaderID].port, time.Duration(r.rpcPeriodMS))
-							if len(output) > 0 {
-								break
-							}
+						output = "Error: Non-existent key"
+						break
+					}
+				} else {
+					if r.status == Follower {
+						output = sendAndRecvNoRetry(msg, r.peers[r.votedFor].ip, r.peers[r.votedFor].port, time.Duration(RPCTimeout*time.Millisecond))
+						if len(output) > 0 {
+							break
 						} else {
 							output = "ko"
 							break
 						}
 					}
-				}
-			} else {
-				output = sendAndRecvNoRetry(msg, r.conns[node][r.leaderID].ip, r.conns[node][r.leaderID].port, time.Duration(r.rpcPeriodMS))
-				if len(output) == 0 {
-					output = "ko"
 				}
 			}
 		} else {
@@ -602,12 +676,12 @@ func (r *Raft) handleCommands(msg string, conn net.Conn) string {
 		parts := strings.Fields(msg)
 		fmt.Println(parts, len(parts))
 		if len(parts) == 5 {
-			server, _ := strconv.Atoi(parts[1])
-			currTerm, _ := strconv.Atoi(parts[2])
+			term, _ := strconv.Atoi(parts[1])
+			server, _ := strconv.Atoi(parts[2])
 			lastTerm, _ := strconv.Atoi(parts[3])
 			lastIndex, _ := strconv.Atoi(parts[4])
 
-			output = r.processVoteRequest(server, currTerm, lastTerm, lastIndex)
+			output = r.processVoteRequest(term, server, lastTerm, lastIndex)
 		}
 	} else if strings.HasPrefix(msg, "APPEND-REQ") {
 		fmt.Println(msg)
@@ -626,23 +700,30 @@ func (r *Raft) handleCommands(msg string, conn net.Conn) string {
 		fmt.Println("Invalid command:", msg)
 		output = "Error: Invalid command"
 	}
+	//fmt.Println(r.me, len(r.ht.table))
+	//fmt.Println(r.log)
 	return output
 }
 
-func (r *Raft) parseLogs(input string) [][]string {
+func (r *Raft) parseLogs(input string) []CommandTerm {
 	input = input[1 : len(input)-1]
 	if len(input) > 0 {
 		inputsplit := strings.Split(input[1:len(input)-1], ";")
-		output := make([][]string, len(inputsplit))
+		output := make([]CommandTerm, len(inputsplit))
 
 		for i := 0; i < len(inputsplit); i++ {
 			keyval := strings.Split(inputsplit[i][1:len(inputsplit[i])], ",")
-			output[i] = keyval
+			cmd := keyval[0]
+			term, _ := strconv.Atoi(keyval[1])
+			output[i] = CommandTerm{
+				Command: cmd,
+				Term:    term,
+			}
 		}
 		fmt.Println(output)
 		return output
 	} else {
-		return make([][]string, 0)
+		return make([]CommandTerm, 0)
 	}
 
 }

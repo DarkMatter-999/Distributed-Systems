@@ -32,7 +32,7 @@ func sendAndRecvNoRetry(msg string, ip string, port string, timeout time.Duratio
         conn.SetReadDeadline(time.Now().Add(timeout))
     }
 
-    buf := make([]byte, 4096)
+    buf := make([]byte, 2048)
     n, err := conn.Read(buf)
     if err != nil {
         fmt.Println(err)
